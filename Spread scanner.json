@@ -1,0 +1,159 @@
+{
+  "id": "LT8PIxYqhyloPEY9",
+  "name": "CEX/DEX Spread Scanner - MEXC vs Jupiter Solana",
+  "active": false,
+  "nodes": [
+    {
+      "id": "node1",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "node2",
+      "name": "MEXC Tickers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 300],
+      "parameters": {
+        "url": "https://api.mexc.com/api/v3/ticker/price",
+        "method": "GET",
+        "options": {}
+      }
+    },
+    {
+      "id": "node3",
+      "name": "Jupiter Token List",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300],
+      "parameters": {
+        "url": "https://token.jup.ag/strict",
+        "method": "GET",
+        "options": {}
+      }
+    },
+    {
+      "id": "node4",
+      "name": "Find Common Tokens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300],
+      "parameters": {
+        "jsCode": "const mexcTickers = $('MEXC Tickers').first().json;\nconst jupTokens = $input.first().json;\n\n// Build MEXC USDT price map: symbol → price\nconst mexcPriceMap = {};\nfor (const ticker of mexcTickers) {\n  if (typeof ticker.symbol === 'string' && ticker.symbol.endsWith('USDT')) {\n    const base = ticker.symbol.slice(0, -4);\n    mexcPriceMap[base] = parseFloat(ticker.price);\n  }\n}\n\n// Map Jupiter symbol → mint (first verified match only)\nconst jupMintMap = {};\nfor (const token of jupTokens) {\n  const sym = (token.symbol || '').toUpperCase();\n  if (sym && mexcPriceMap[sym] !== undefined && !jupMintMap[sym]) {\n    jupMintMap[sym] = token.address;\n  }\n}\n\n// Build common tokens list\nconst commonTokens = [];\nfor (const [sym, mint] of Object.entries(jupMintMap)) {\n  commonTokens.push({ symbol: sym, mint, mexcPrice: mexcPriceMap[sym] });\n}\n\n// Jupiter API limit: 100 ids per request\nconst batch = commonTokens.slice(0, 100);\nconst mintIds = batch.map(t => t.mint).join(',');\n\nreturn [{ json: { commonTokens: batch, mintIds, totalCommon: commonTokens.length } }];"
+      }
+    },
+    {
+      "id": "node5",
+      "name": "Jupiter Prices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 300],
+      "parameters": {
+        "url": "=https://api.jup.ag/price/v2?ids={{ $json.mintIds }}",
+        "method": "GET",
+        "options": {}
+      }
+    },
+    {
+      "id": "node6",
+      "name": "Calculate Spreads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300],
+      "parameters": {
+        "jsCode": "const { commonTokens } = $('Find Common Tokens').first().json;\nconst jupResponse = $input.first().json;\nconst priceData = jupResponse.data || {};\nconst spreads = [];\n\nfor (const token of commonTokens) {\n  const jupData = priceData[token.mint];\n  if (!jupData || !jupData.price) continue;\n\n  const mexcPrice = token.mexcPrice;\n  const jupPrice = parseFloat(jupData.price);\n\n  if (jupPrice === 0 || isNaN(jupPrice) || isNaN(mexcPrice)) continue;\n\n  const spreadPct = ((mexcPrice - jupPrice) / jupPrice) * 100;\n  const absSpread = Math.abs(spreadPct);\n\n  if (absSpread >= 5) {\n    spreads.push({\n      symbol: token.symbol,\n      mexcPrice: mexcPrice.toFixed(8),\n      jupPrice: jupPrice.toFixed(8),\n      spreadPct: spreadPct.toFixed(2),\n      absSpread: absSpread.toFixed(2),\n      direction: spreadPct > 0 ? 'Buy JUP → Sell MEXC' : 'Buy MEXC → Sell JUP'\n    });\n  }\n}\n\nspreads.sort((a, b) => parseFloat(b.absSpread) - parseFloat(a.absSpread));\n\nreturn [{ json: {\n  spreads,\n  hasAlerts: spreads.length > 0,\n  count: spreads.length,\n  timestamp: new Date().toISOString()\n} }];"
+      }
+    },
+    {
+      "id": "node7",
+      "name": "Has Spreads?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "node8",
+      "name": "Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1680, 200],
+      "parameters": {
+        "chatId": "VOTRE_CHAT_ID",
+        "text": "=🚨 *Spread Alert: MEXC ↔ Jupiter Solana*\n⏱ {{ $json.timestamp }}\n📊 {{ $json.count }} opportunité(s) ≥ 5%\n\n{{ $json.spreads.map(s => `• *${s.symbol}*\\nMEXC: $${s.mexcPrice} | JUP: $${s.jupPrice}\\nSpread: ${s.spreadPct}% → ${s.direction}`).join('\\n\\n') }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [[{ "node": "MEXC Tickers", "type": "main", "index": 0 }]]
+    },
+    "MEXC Tickers": {
+      "main": [[{ "node": "Jupiter Token List", "type": "main", "index": 0 }]]
+    },
+    "Jupiter Token List": {
+      "main": [[{ "node": "Find Common Tokens", "type": "main", "index": 0 }]]
+    },
+    "Find Common Tokens": {
+      "main": [[{ "node": "Jupiter Prices", "type": "main", "index": 0 }]]
+    },
+    "Jupiter Prices": {
+      "main": [[{ "node": "Calculate Spreads", "type": "main", "index": 0 }]]
+    },
+    "Calculate Spreads": {
+      "main": [[{ "node": "Has Spreads?", "type": "main", "index": 0 }]]
+    },
+    "Has Spreads?": {
+      "main": [
+        [{ "node": "Telegram Alert", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "1bce1ac4-9a2f-41b2-a697-b1eb0ab5fb50",
+  "updatedAt": "2026-05-26T14:59:33.313Z",
+  "createdAt": "2026-05-26T14:59:33.313Z"
+}
