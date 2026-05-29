@@ -1,0 +1,146 @@
+{
+  "name": "MEXC Futures / Jupiter — Common Token Discovery",
+  "nodes": [
+    {
+      "id": "f1",
+      "name": "Weekly Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [1],
+              "triggerAtHour": 0,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f2",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 500],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "futures-common-tokens-discovery",
+        "responseMode": "onReceived"
+      }
+    },
+    {
+      "id": "f3",
+      "name": "MEXC Futures Tickers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 300],
+      "parameters": {
+        "url": "https://contract.mexc.com/api/v1/contract/ticker",
+        "method": "GET",
+        "options": {}
+      }
+    },
+    {
+      "id": "f4",
+      "name": "Build MEXC Futures Map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300],
+      "parameters": {
+        "jsCode": "// MEXC Futures symbols are formatted as BASE_USDT (e.g. BTC_USDT)\nconst tickers = $input.first().json.data || [];\nconst seen = new Set();\nconst items = [];\nfor (const t of tickers) {\n  if (typeof t.symbol !== 'string' || !t.symbol.endsWith('_USDT')) continue;\n  const sym = t.symbol.slice(0, -5); // strip '_USDT'\n  if (!seen.has(sym) && /^[A-Z]{2,10}$/.test(sym)) {\n    seen.add(sym);\n    items.push({ json: { symbol: sym, mexcPrice: parseFloat(t.lastPrice) } });\n  }\n}\nreturn items;"
+      }
+    },
+    {
+      "id": "f5",
+      "name": "Jupiter Ultra Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300],
+      "parameters": {
+        "url": "https://api.jup.ag/ultra/v1/search",
+        "method": "GET",
+        "options": {},
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "x-api-key", "value": "YOUR_JUPITER_API_KEY" }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "query", "value": "={{ $json.symbol }}" }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "f6",
+      "name": "Find Common Tokens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "parameters": {
+        "jsCode": "const jupItems = $input.all();\nconst tokenItems = $('Build MEXC Futures Map').all();\n\nconst mexcLookup = {};\nfor (const item of tokenItems) {\n  mexcLookup[item.json.symbol] = item.json.mexcPrice;\n}\n\nconst common = [];\nconst seenMints = new Set();\n\nfor (const jupItem of jupItems) {\n  const r = jupItem.json;\n  const sym = (r.symbol || '').toUpperCase();\n\n  if (!mexcLookup[sym] || !r.id || seenMints.has(r.id)) continue;\n\n  const mexcPrice = mexcLookup[sym];\n  const jupPrice = parseFloat(r.usdPrice || 0);\n\n  // Price sanity filter: within 5% to eliminate false symbol matches\n  if (jupPrice <= 0 || Math.abs((mexcPrice - jupPrice) / jupPrice) > 0.05) continue;\n\n  seenMints.add(r.id);\n\n  const stats24h = r.stats24h || {};\n  common.push({\n    symbol: sym,\n    mint: r.id,\n    name: r.name || sym,\n    decimals: r.decimals ?? null,\n    mexc_price: mexcPrice,\n    jup_price: jupPrice,\n    jup_volume_24h: (stats24h.buyVolume || 0) + (stats24h.sellVolume || 0),\n    jup_liquidity: r.liquidity || 0,\n    tags: Array.isArray(r.tags) ? r.tags.join(',') : '',\n    updated_at: new Date().toISOString()\n  });\n}\n\ncommon.sort((a, b) => a.symbol.localeCompare(b.symbol));\nconsole.log(`Found ${common.length} common futures tokens out of ${Object.keys(mexcLookup).length} MEXC futures symbols`);\nreturn common.map(t => ({ json: t }));"
+      }
+    },
+    {
+      "id": "f7",
+      "name": "Save to Supabase",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ymwjfvtqtgtfqfiojsyx.supabase.co/rest/v1/common_tokens_futures",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB" },
+            { "name": "Authorization", "value": "Bearer sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates,return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Schedule": {
+      "main": [[{ "node": "MEXC Futures Tickers", "type": "main", "index": 0 }]]
+    },
+    "Webhook Trigger": {
+      "main": [[{ "node": "MEXC Futures Tickers", "type": "main", "index": 0 }]]
+    },
+    "MEXC Futures Tickers": {
+      "main": [[{ "node": "Build MEXC Futures Map", "type": "main", "index": 0 }]]
+    },
+    "Build MEXC Futures Map": {
+      "main": [[{ "node": "Jupiter Ultra Search", "type": "main", "index": 0 }]]
+    },
+    "Jupiter Ultra Search": {
+      "main": [[{ "node": "Find Common Tokens", "type": "main", "index": 0 }]]
+    },
+    "Find Common Tokens": {
+      "main": [[{ "node": "Save to Supabase", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all"
+  }
+}
