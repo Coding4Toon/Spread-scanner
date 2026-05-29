@@ -1,0 +1,161 @@
+{
+  "name": "CEX/DEX Spread Scanner - MEXC Futures vs Jupiter Solana",
+  "nodes": [
+    {
+      "id": "fs1",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 2 }]
+        }
+      }
+    },
+    {
+      "id": "fs2",
+      "name": "MEXC Futures Tickers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 300],
+      "parameters": {
+        "url": "https://contract.mexc.com/api/v1/contract/ticker",
+        "method": "GET",
+        "options": {}
+      }
+    },
+    {
+      "id": "fs3",
+      "name": "Find Common Tokens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300],
+      "parameters": {
+        "jsCode": "// Fetch verified futures tokens from Supabase\nconst dbTokens = await $helpers.httpRequest({\n  method: 'GET',\n  url: 'https://ymwjfvtqtgtfqfiojsyx.supabase.co/rest/v1/common_tokens_futures?select=symbol,mint',\n  headers: {\n    'apikey': 'sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB',\n    'Authorization': 'Bearer sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB'\n  }\n});\n\n// Build token map: symbol → mint\nconst tokenMap = {};\nfor (const token of dbTokens) {\n  if (token.symbol && token.mint) tokenMap[token.symbol] = token.mint;\n}\n\n// Build MEXC Futures price map: symbol → price\n// Futures response: { success: true, data: [{ symbol: 'BTC_USDT', lastPrice: '...' }] }\nconst tickers = $input.first().json.data || [];\nconst mexcPriceMap = {};\nfor (const t of tickers) {\n  if (typeof t.symbol === 'string' && t.symbol.endsWith('_USDT')) {\n    mexcPriceMap[t.symbol.slice(0, -5)] = parseFloat(t.lastPrice);\n  }\n}\n\n// Intersect: tokens present on both exchanges right now\nconst result = [];\nfor (const [sym, mint] of Object.entries(tokenMap)) {\n  if (mexcPriceMap[sym] !== undefined) {\n    result.push({ symbol: sym, mint, mexcPrice: mexcPriceMap[sym] });\n  }\n}\n\nreturn result.map(t => ({ json: t }));"
+      }
+    },
+    {
+      "id": "fs4",
+      "name": "Jupiter Prices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300],
+      "parameters": {
+        "url": "https://api.jup.ag/ultra/v1/search",
+        "method": "GET",
+        "options": {},
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [{ "name": "query", "value": "={{ $json.mint }}" }]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "x-api-key", "value": "YOUR_JUPITER_API_KEY" }
+          ]
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "fs5",
+      "name": "Calculate Spreads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "parameters": {
+        "jsCode": "const jupItems = $input.all();\nconst tokenItems = $('Find Common Tokens').all();\nconst spreads = [];\nconst timestamp = new Date().toISOString();\n\nfor (let i = 0; i < jupItems.length; i++) {\n  const jupResp = jupItems[i].json;\n  const token = tokenItems[i]?.json;\n  if (!token) continue;\n\n  const results = Array.isArray(jupResp) ? jupResp : (jupResp.results || [jupResp]);\n  const tokenData = results.find(r => r.address === token.mint || r.id === token.mint) || results[0];\n  if (!tokenData) continue;\n\n  const jupPrice = parseFloat(tokenData.usdPrice || tokenData.price || tokenData.priceUsd || 0);\n  const mexcPrice = token.mexcPrice;\n\n  if (!jupPrice || isNaN(jupPrice) || isNaN(mexcPrice)) continue;\n\n  const spreadPct = ((mexcPrice - jupPrice) / jupPrice) * 100;\n  const absSpread = Math.abs(spreadPct);\n\n  if (absSpread >= 5) {\n    spreads.push({\n      symbol: token.symbol,\n      mint: token.mint,\n      mexc_price: mexcPrice,\n      jup_price: jupPrice,\n      spread_pct: parseFloat(spreadPct.toFixed(4)),\n      abs_spread_pct: parseFloat(absSpread.toFixed(4)),\n      direction: spreadPct > 0 ? 'Buy JUP -> Sell MEXC Futures' : 'Buy MEXC Futures -> Sell JUP'\n    });\n  }\n}\n\nspreads.sort((a, b) => b.abs_spread_pct - a.abs_spread_pct);\nreturn [{ json: { spreads, count: spreads.length, tokens_compared: jupItems.length, timestamp } }];"
+      }
+    },
+    {
+      "id": "fs6",
+      "name": "Log Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ymwjfvtqtgtfqfiojsyx.supabase.co/rest/v1/spread_scans_futures",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB" },
+            { "name": "Authorization", "value": "Bearer sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ scanned_at: $('Calculate Spreads').first().json.timestamp, tokens_compared: $('Calculate Spreads').first().json.tokens_compared, alerts_count: $('Calculate Spreads').first().json.count }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "fs7",
+      "name": "Has Spreads?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict", "version": 2 },
+          "conditions": [{
+            "id": "cond1",
+            "leftValue": "={{ $('Calculate Spreads').first().json.count }}",
+            "rightValue": 0,
+            "operator": { "type": "number", "operation": "gt" }
+          }],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "fs8",
+      "name": "Save Spread Alerts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, 200],
+      "parameters": {
+        "method": "POST",
+        "url": "https://ymwjfvtqtgtfqfiojsyx.supabase.co/rest/v1/spread_alerts_futures",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB" },
+            { "name": "Authorization", "value": "Bearer sb_publishable_nI6zclBG_CYamJP5PjgXoA_dTzFBHWB" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Calculate Spreads').first().json.spreads.map(s => ({ scan_id: $json[0].id, scanned_at: $('Calculate Spreads').first().json.timestamp, symbol: s.symbol, mint: s.mint, mexc_price: s.mexc_price, jup_price: s.jup_price, spread_pct: s.spread_pct, abs_spread_pct: s.abs_spread_pct, direction: s.direction, exchanges: 'MEXC Futures/Jupiter' })) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": { "main": [[{ "node": "MEXC Futures Tickers", "type": "main", "index": 0 }]] },
+    "MEXC Futures Tickers": { "main": [[{ "node": "Find Common Tokens", "type": "main", "index": 0 }]] },
+    "Find Common Tokens": { "main": [[{ "node": "Jupiter Prices", "type": "main", "index": 0 }]] },
+    "Jupiter Prices": { "main": [[{ "node": "Calculate Spreads", "type": "main", "index": 0 }]] },
+    "Calculate Spreads": { "main": [[{ "node": "Log Scan", "type": "main", "index": 0 }]] },
+    "Log Scan": { "main": [[{ "node": "Has Spreads?", "type": "main", "index": 0 }]] },
+    "Has Spreads?": {
+      "main": [
+        [{ "node": "Save Spread Alerts", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none"
+  }
+}
