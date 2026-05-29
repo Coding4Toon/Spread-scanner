@@ -9,7 +9,7 @@
       "position": [0, 300],
       "parameters": {
         "rule": {
-          "interval": [{ "field": "minutes", "minutesInterval": 2 }]
+          "interval": [{ "field": "seconds", "secondsInterval": 30 }]
         }
       }
     },
@@ -37,29 +37,13 @@
     },
     {
       "id": "fs4",
-      "name": "Jupiter Prices",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
+      "name": "Fetch Jupiter Prices",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [720, 300],
       "parameters": {
-        "url": "https://api.jup.ag/ultra/v1/search",
-        "method": "GET",
-        "options": {},
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [{ "name": "query", "value": "={{ $json.mint }}" }]
-        },
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "Accept", "value": "application/json" },
-            { "name": "x-api-key", "value": "YOUR_JUPITER_API_KEY" }
-          ]
-        }
-      },
-      "retryOnFail": true,
-      "maxTries": 3,
-      "onError": "continueRegularOutput"
+        "jsCode": "const tokens = $input.all();\nif (!tokens.length) return [];\n\nconst mints = tokens.map(t => t.json.mint);\n\n// Split into batches of 50 (price/v3 limit)\nconst batches = [];\nfor (let i = 0; i < mints.length; i += 50) {\n  batches.push(mints.slice(i, i + 50).join(','));\n}\n\n// Fetch all batches in parallel\nconst results = await Promise.all(batches.map(ids =>\n  $helpers.httpRequest({\n    method: 'GET',\n    url: `https://api.jup.ag/price/v3?ids=${ids}`,\n    headers: { 'x-api-key': 'YOUR_JUPITER_API_KEY' }\n  })\n));\n\n// Merge into a single price map: mint → usdPrice\nconst priceMap = {};\nfor (const batch of results) {\n  for (const [mint, data] of Object.entries(batch)) {\n    if (data && data.usdPrice != null) {\n      priceMap[mint] = parseFloat(data.usdPrice);\n    }\n  }\n}\n\n// Return enriched token items (only those with a Jupiter price)\nreturn tokens\n  .filter(t => priceMap[t.json.mint] != null)\n  .map(t => ({\n    json: {\n      symbol: t.json.symbol,\n      mint: t.json.mint,\n      mexcPrice: t.json.mexcPrice,\n      jupPrice: priceMap[t.json.mint]\n    }\n  }));"
+      }
     },
     {
       "id": "fs5",
@@ -68,7 +52,7 @@
       "typeVersion": 2,
       "position": [960, 300],
       "parameters": {
-        "jsCode": "const jupItems = $input.all();\nconst tokenItems = $('Find Common Tokens').all();\nconst spreads = [];\nconst timestamp = new Date().toISOString();\n\nfor (let i = 0; i < jupItems.length; i++) {\n  const jupResp = jupItems[i].json;\n  const token = tokenItems[i]?.json;\n  if (!token) continue;\n\n  const results = Array.isArray(jupResp) ? jupResp : (jupResp.results || [jupResp]);\n  const tokenData = results.find(r => r.address === token.mint || r.id === token.mint) || results[0];\n  if (!tokenData) continue;\n\n  const jupPrice = parseFloat(tokenData.usdPrice || tokenData.price || tokenData.priceUsd || 0);\n  const mexcPrice = token.mexcPrice;\n\n  if (!jupPrice || isNaN(jupPrice) || isNaN(mexcPrice)) continue;\n\n  const spreadPct = ((mexcPrice - jupPrice) / jupPrice) * 100;\n  const absSpread = Math.abs(spreadPct);\n\n  if (absSpread >= 5) {\n    spreads.push({\n      symbol: token.symbol,\n      mint: token.mint,\n      mexc_price: mexcPrice,\n      jup_price: jupPrice,\n      spread_pct: parseFloat(spreadPct.toFixed(4)),\n      abs_spread_pct: parseFloat(absSpread.toFixed(4)),\n      direction: spreadPct > 0 ? 'Buy JUP -> Sell MEXC Futures' : 'Buy MEXC Futures -> Sell JUP'\n    });\n  }\n}\n\nspreads.sort((a, b) => b.abs_spread_pct - a.abs_spread_pct);\nreturn [{ json: { spreads, count: spreads.length, tokens_compared: jupItems.length, timestamp } }];"
+        "jsCode": "const items = $input.all();\nconst spreads = [];\nconst timestamp = new Date().toISOString();\n\nfor (const item of items) {\n  const { symbol, mint, mexcPrice, jupPrice } = item.json;\n  if (!jupPrice || !mexcPrice || isNaN(jupPrice) || isNaN(mexcPrice)) continue;\n\n  const spreadPct = ((mexcPrice - jupPrice) / jupPrice) * 100;\n  const absSpread = Math.abs(spreadPct);\n\n  if (absSpread >= 5) {\n    spreads.push({\n      symbol, mint,\n      mexc_price: mexcPrice,\n      jup_price: jupPrice,\n      spread_pct: parseFloat(spreadPct.toFixed(4)),\n      abs_spread_pct: parseFloat(absSpread.toFixed(4)),\n      direction: spreadPct > 0 ? 'Buy JUP -> Sell MEXC Futures' : 'Buy MEXC Futures -> Sell JUP'\n    });\n  }\n}\n\nspreads.sort((a, b) => b.abs_spread_pct - a.abs_spread_pct);\nreturn [{ json: { spreads, count: spreads.length, tokens_compared: items.length, timestamp } }];"
       }
     },
     {
@@ -104,12 +88,7 @@
       "parameters": {
         "conditions": {
           "options": { "caseSensitive": true, "typeValidation": "strict", "version": 2 },
-          "conditions": [{
-            "id": "cond1",
-            "leftValue": "={{ $('Calculate Spreads').first().json.count }}",
-            "rightValue": 0,
-            "operator": { "type": "number", "operation": "gt" }
-          }],
+          "conditions": [{"id": "cond1", "leftValue": "={{ $('Calculate Spreads').first().json.count }}", "rightValue": 0, "operator": {"type": "number", "operation": "gt"}}],
           "combinator": "and"
         }
       }
@@ -142,8 +121,8 @@
   "connections": {
     "Schedule Trigger": { "main": [[{ "node": "MEXC Futures Tickers", "type": "main", "index": 0 }]] },
     "MEXC Futures Tickers": { "main": [[{ "node": "Find Common Tokens", "type": "main", "index": 0 }]] },
-    "Find Common Tokens": { "main": [[{ "node": "Jupiter Prices", "type": "main", "index": 0 }]] },
-    "Jupiter Prices": { "main": [[{ "node": "Calculate Spreads", "type": "main", "index": 0 }]] },
+    "Find Common Tokens": { "main": [[{ "node": "Fetch Jupiter Prices", "type": "main", "index": 0 }]] },
+    "Fetch Jupiter Prices": { "main": [[{ "node": "Calculate Spreads", "type": "main", "index": 0 }]] },
     "Calculate Spreads": { "main": [[{ "node": "Log Scan", "type": "main", "index": 0 }]] },
     "Log Scan": { "main": [[{ "node": "Has Spreads?", "type": "main", "index": 0 }]] },
     "Has Spreads?": {
