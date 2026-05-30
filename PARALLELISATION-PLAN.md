@@ -51,3 +51,29 @@ SELECT group_id, COUNT(*) FROM common_tokens_futures GROUP BY group_id ORDER BY 
 SELECT group_id, COUNT(*), MAX(scanned_at) FROM spread_scans GROUP BY group_id ORDER BY group_id;
 SELECT group_id, COUNT(*), MAX(scanned_at) FROM spread_scans_futures GROUP BY group_id ORDER BY group_id;
 ```
+
+---
+
+## Update — Filtre direction DEX→CEX uniquement
+
+**Contexte :** Seule la direction **Buy JUP → Sell MEXC** est intéressante (arb DEX→CEX). La direction inverse (Buy MEXC → Sell JUP) a été supprimée.
+
+**Changement appliqué sur les 12 workflows** (nœud `Calculate Spreads`) :
+
+```javascript
+// Avant
+if (absSpread >= 5) {
+  spreads.push({ ..., direction: spreadPct > 0 ? 'Buy JUP -> Sell MEXC' : 'Buy MEXC -> Sell JUP' });
+}
+
+// Après
+if (absSpread >= 5 && spreadPct > 0) {
+  spreads.push({ ..., direction: 'Buy JUP -> Sell MEXC' });
+}
+```
+
+```sql
+-- Vérification : une seule direction en DB
+SELECT DISTINCT direction FROM spread_alerts;
+SELECT DISTINCT direction FROM spread_alerts_futures;
+```
