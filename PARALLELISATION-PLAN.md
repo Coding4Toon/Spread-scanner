@@ -77,3 +77,79 @@ if (absSpread >= 5 && spreadPct > 0) {
 SELECT DISTINCT direction FROM spread_alerts;
 SELECT DISTINCT direction FROM spread_alerts_futures;
 ```
+
+---
+
+## Update — Production Hardening (2026-05-30)
+
+### Clés API & Sécurité
+
+- **MEXC API Key** : rotation vers nouvelle clé avec IP whitelist `72.62.70.105` (IP du serveur n8n)
+- **Jupiter API** : 3 clés distribuées, 4 workflows par clé pour répartir la charge
+  - Clé 1 → Spot G1-G4
+  - Clé 2 (Corto) → Spot G5-G7 + Futures G1
+  - Clé 3 (Thundori) → Futures G2-G5
+- **RLS** : policies ajoutées sur 9 tables précédemment exposées sans protection (voir migration 005)
+
+### Rate Limiting Jupiter (résolu)
+
+- Retry avec **2s de backoff** entre tentatives (`waitBetweenTries: 2000`, `maxTries: 3`)
+- **Jitter Delay** (0–3s aléatoire) ajouté comme premier node après Schedule Trigger — évite la synchronisation simultanée des 12 workflows sur le même tick
+
+### Optimisation DB
+
+- **Log Scan conditionnel** : déplacé après `Has Spreads?` — aucune insertion si 0 spread détecté (~95% des cycles silencieux)
+- **Auto-prune** : trigger Postgres garde les **50 derniers scans par `group_id`** (illimité avant → croissance inutile)
+- **FK CASCADE** : suppression d'un scan cascade automatiquement sur ses alertes liées
+- **Données purgées** au 2026-05-30 — repartir de zéro après optimisation
+
+### Jupiter 5min Price Change
+
+- Nouveau node **`Fetch Jupiter Stats`** inséré sur la branche "spread détecté" uniquement
+- Appel `api.jup.ag/ultra/v1/search?query={mint}&mode=strict` (endpoint public, pas de clé) par token en spread
+- Champ `stats5m.priceChange` stocké dans colonne `jup_price_change_5m` (real) sur `spread_alerts` et `spread_alerts_futures`
+
+### Flow final (par workflow)
+
+```
+Schedule Trigger (5s)
+→ Jitter Delay (0–3s random)
+→ MEXC Tickers (spot: /ticker/price | futures: /contract/ticker)
+→ Build MEXC Price Map
+→ Fetch DB Tokens (filtered by group_id)
+→ Find Common Tokens
+→ Prepare Batches
+→ Fetch Jupiter Prices (api.jup.ag/price/v3, retry 3x backoff 2s)
+→ Calculate Spreads (threshold ≥5%, Buy JUP→Sell MEXC only)
+→ Has Spreads?
+   └─ [false] → stop — nothing written to DB
+   └─ [true]
+      → Fetch Jupiter Stats (stats5m.priceChange via ultra/v1/search)
+      → Log Scan → spread_scans / spread_scans_futures  (auto-pruned to 50/group)
+      → Build MEXC Auth (pure-JS HMAC-SHA256, no external deps)
+      → Fetch MEXC Deposit Status (capital/config/getall)
+      → Enrich Spreads (deposit_open + jup_price_change_5m)
+      → Save Spread Alerts → spread_alerts / spread_alerts_futures
+```
+
+### Migrations appliquées
+
+| Fichier | Description |
+|---|---|
+| `005_rls_policies.sql` | RLS activé + policies anon sur 9 tables |
+| `006_spread_scans_prune_and_cascade.sql` | Triggers auto-prune (50/group) + FK CASCADE |
+| `007_add_jup_price_change_5m.sql` | Colonnes `jup_price_change_5m` sur les tables d'alertes |
+
+### Schema final spread_alerts
+
+```
+id, scan_id, scanned_at, symbol, mint,
+mexc_price, jup_price, spread_pct, abs_spread_pct,
+direction, exchanges, deposit_open, jup_price_change_5m
+```
+
+### Credentials requis (voir credentials.example.json)
+
+- Supabase project ref + anon key
+- MEXC API key + secret (avec IP whitelist sur le serveur n8n)
+- Jupiter API keys (3 clés recommandées pour 12 workflows)

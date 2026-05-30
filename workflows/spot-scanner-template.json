@@ -1,0 +1,505 @@
+{
+  "_comment": "Template for CEX/DEX Spread Scanner - Spot GN. Replace all {{PLACEHOLDERS}} before importing to n8n. Change group_id=eq.N in Fetch DB Tokens URL and Log Scan payload for each group.",
+  "name": "CEX/DEX Spread Scanner - Spot G1",
+  "nodes": [
+    {
+      "id": "s1",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "jitter",
+      "name": "Jitter Delay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        300
+      ],
+      "parameters": {
+        "jsCode": "await new Promise(r => setTimeout(r, Math.floor(Math.random() * 3000)));\nreturn $input.all();"
+      }
+    },
+    {
+      "id": "s2",
+      "name": "MEXC Tickers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "url": "https://api.mexc.com/api/v3/ticker/price",
+        "method": "GET",
+        "options": {}
+      }
+    },
+    {
+      "id": "s3",
+      "name": "Build MEXC Price Map",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const mexcPriceMap = {};\nfor (const item of $input.all()) {\n  const t = item.json;\n  if (typeof t.symbol === 'string' && t.symbol.endsWith('USDT')) {\n    mexcPriceMap[t.symbol.slice(0, -4)] = parseFloat(t.price);\n  }\n}\nreturn [{ json: { mexcPriceMap } }];"
+      }
+    },
+    {
+      "id": "s4",
+      "name": "Fetch DB Tokens",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "url": "https://{{SUPABASE_PROJECT_REF}}.supabase.co/rest/v1/common_tokens?select=symbol,mint&group_id=eq.1",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "{{SUPABASE_ANON_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{SUPABASE_ANON_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "s5",
+      "name": "Find Common Tokens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const mexcPriceMap = $('Build MEXC Price Map').first().json.mexcPriceMap;\nconst dbTokens = $input.all().map(item => item.json);\nconst result = [];\nfor (const token of dbTokens) {\n  const { symbol, mint } = token;\n  if (symbol && mint && mexcPriceMap[symbol] !== undefined) {\n    result.push({ symbol, mint, mexcPrice: mexcPriceMap[symbol] });\n  }\n}\nreturn result.map(t => ({ json: t }));"
+      }
+    },
+    {
+      "id": "s6",
+      "name": "Prepare Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const mints = $input.all().map(t => t.json.mint);\nconst batches = [];\nfor (let i = 0; i < mints.length; i += 50) {\n  batches.push(mints.slice(i, i + 50).join(','));\n}\nreturn batches.map(ids => ({ json: { mintIds: ids } }));"
+      }
+    },
+    {
+      "id": "s7",
+      "name": "Fetch Jupiter Prices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "parameters": {
+        "url": "=https://api.jup.ag/price/v3?ids={{ $json.mintIds }}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "{{JUPITER_API_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "s8",
+      "name": "Calculate Spreads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const priceMap = {};\nfor (const item of $input.all()) {\n  for (const [mint, data] of Object.entries(item.json)) {\n    if (data && data.usdPrice != null) priceMap[mint] = parseFloat(data.usdPrice);\n  }\n}\nconst tokens = $('Find Common Tokens').all();\nconst spreads = [];\nconst timestamp = new Date().toISOString();\nfor (const item of tokens) {\n  const { symbol, mint, mexcPrice } = item.json;\n  const jupPrice = priceMap[mint];\n  if (!jupPrice || !mexcPrice || isNaN(jupPrice) || isNaN(mexcPrice)) continue;\n  const spreadPct = ((mexcPrice - jupPrice) / jupPrice) * 100;\n  const absSpread = Math.abs(spreadPct);\n  if (absSpread >= 5 && spreadPct > 0) {\n    spreads.push({ symbol, mint, mexc_price: mexcPrice, jup_price: jupPrice,\n      spread_pct: parseFloat(spreadPct.toFixed(4)),\n      abs_spread_pct: parseFloat(absSpread.toFixed(4)),\n      direction: 'Buy JUP -> Sell MEXC' });\n  }\n}\nspreads.sort((a, b) => b.abs_spread_pct - a.abs_spread_pct);\nreturn [{ json: { spreads, count: spreads.length, tokens_compared: tokens.length, timestamp } }];"
+      }
+    },
+    {
+      "id": "s10",
+      "name": "Has Spreads?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $('Calculate Spreads').first().json.count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "stats",
+      "name": "Fetch Jupiter Stats",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2300,
+        120
+      ],
+      "parameters": {
+        "jsCode": "const spreads = $('Calculate Spreads').first().json.spreads;\nconst statsMap = {};\nfor (const spread of spreads) {\n  try {\n    const res = await fetch(`https://api.jup.ag/ultra/v1/search?query=${spread.mint}&mode=strict`);\n    const data = await res.json();\n    if (Array.isArray(data) && data.length > 0) {\n      statsMap[spread.mint] = data[0].stats5m?.priceChange ?? null;\n    } else {\n      statsMap[spread.mint] = null;\n    }\n  } catch(e) {\n    statsMap[spread.mint] = null;\n  }\n}\nreturn [{ json: { statsMap } }];"
+      }
+    },
+    {
+      "id": "s9",
+      "name": "Log Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2450,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://{{SUPABASE_PROJECT_REF}}.supabase.co/rest/v1/spread_scans",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "{{SUPABASE_ANON_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{SUPABASE_ANON_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ group_id: 1, scanned_at: $('Calculate Spreads').first().json.timestamp, tokens_compared: $('Calculate Spreads').first().json.tokens_compared, alerts_count: $('Calculate Spreads').first().json.count }) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "auth1",
+      "name": "Build MEXC Auth",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        120
+      ],
+      "parameters": {
+        "jsCode": "// HMAC-SHA256 pure JS — replace {{MEXC_API_KEY}} and {{MEXC_API_SECRET}}\nconst apiKey=\"{{MEXC_API_KEY}}\",apiSecret=\"{{MEXC_API_SECRET}}\",timestamp=Date.now(),qs=;\n// ... (full HMAC implementation in production workflow)\nreturn [{json:{url:,apiKey}}];"
+      }
+    },
+    {
+      "id": "dep1",
+      "name": "Fetch MEXC Deposit Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        120
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "method": "GET",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-MEXC-APIKEY",
+              "value": "={{ $json.apiKey }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "enr1",
+      "name": "Enrich Spreads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        120
+      ],
+      "parameters": {
+        "jsCode": "const depositData = $input.all();\nconst depositMap = {};\nfor (const item of depositData) {\n  const c = item.json;\n  if (!c.coin) continue;\n  const networks = c.networkList || [];\n  const solNet = networks.find(n => n.network === 'SOL' || n.network === 'SOLANA' || n.network === 'SPL');\n  depositMap[c.coin] = solNet ? solNet.depositEnable === true : (c.depositEnable !== false);\n}\nconst statsMap = $('Fetch Jupiter Stats').first().json.statsMap;\nconst spreads = $('Calculate Spreads').first().json.spreads;\nconst enriched = spreads.map(s => ({ ...s, deposit_open: depositMap[s.symbol] ?? null, jup_price_change_5m: statsMap[s.mint] ?? null }));\nreturn [{ json: { enrichedSpreads: enriched, count: enriched.length } }];"
+      }
+    },
+    {
+      "id": "s11",
+      "name": "Save Spread Alerts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://{{SUPABASE_PROJECT_REF}}.supabase.co/rest/v1/spread_alerts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "{{SUPABASE_ANON_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer {{SUPABASE_ANON_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=minimal"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Enrich Spreads').first().json.enrichedSpreads.map(s => ({ scan_id: $('Log Scan').first().json.id, scanned_at: $('Calculate Spreads').first().json.timestamp, symbol: s.symbol, mint: s.mint, mexc_price: s.mexc_price, jup_price: s.jup_price, spread_pct: s.spread_pct, abs_spread_pct: s.abs_spread_pct, direction: s.direction, exchanges: 'MEXC/Jupiter', deposit_open: s.deposit_open, jup_price_change_5m: s.jup_price_change_5m })) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Jitter Delay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jitter Delay": {
+      "main": [
+        [
+          {
+            "node": "MEXC Tickers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MEXC Tickers": {
+      "main": [
+        [
+          {
+            "node": "Build MEXC Price Map",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build MEXC Price Map": {
+      "main": [
+        [
+          {
+            "node": "Fetch DB Tokens",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch DB Tokens": {
+      "main": [
+        [
+          {
+            "node": "Find Common Tokens",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Common Tokens": {
+      "main": [
+        [
+          {
+            "node": "Prepare Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Batches": {
+      "main": [
+        [
+          {
+            "node": "Fetch Jupiter Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Jupiter Prices": {
+      "main": [
+        [
+          {
+            "node": "Calculate Spreads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Spreads": {
+      "main": [
+        [
+          {
+            "node": "Has Spreads?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Spreads?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Jupiter Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Jupiter Stats": {
+      "main": [
+        [
+          {
+            "node": "Log Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Scan": {
+      "main": [
+        [
+          {
+            "node": "Build MEXC Auth",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build MEXC Auth": {
+      "main": [
+        [
+          {
+            "node": "Fetch MEXC Deposit Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch MEXC Deposit Status": {
+      "main": [
+        [
+          {
+            "node": "Enrich Spreads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Spreads": {
+      "main": [
+        [
+          {
+            "node": "Save Spread Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none"
+  }
+}
